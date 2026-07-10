@@ -1,0 +1,28 @@
+{
+  "name": "ayame-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord chatbot powered by Gemini, roleplaying as Nakiri Ayame.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "bun index.js",
+    "deploy-commands": "bun deploy-commands.js"
+  },
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.2",
+    "@google/genai": "^2.10.0",
+    "discord.js": "^14.16.3",
+    "distube": "^5.2.3",
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.3.0",
+    "opusscript": "^0.1.1",
+    "tweetnacl": "^1.0.3",
+    "youtubei.js": "^17.2.0"
+  },
+  "trustedDependencies": [
+    "@discordjs/opus",
+    "ffmpeg-static",
+    "protobufjs"
+  ]
+}

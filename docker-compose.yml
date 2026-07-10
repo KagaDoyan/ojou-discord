@@ -1,0 +1,10 @@
+services:
+  ayame-bot:
+    build: .
+    platform: linux/amd64
+    container_name: ayame-discord-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
