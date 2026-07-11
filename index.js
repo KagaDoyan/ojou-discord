@@ -294,32 +294,59 @@ async function runDndLoop(channelId, contents, systemInstruction, tools, startSt
       config: { systemInstruction, temperature: 1.1, maxOutputTokens: 1200, tools },
     });
 
-    const call = response.functionCalls?.[0];
-    if (!call || !isDndAction(call.name)) {
+    // Gemini can return several function calls in a single turn (e.g. spawn_monster +
+    // apply_damage together). Every one of them needs an answering functionResponse in the
+    // very next turn — response.candidates[0].content (replayed into `contents` below) still
+    // contains ALL of them regardless of how many we act on, so handling only calls[0] and
+    // dropping the rest leaves an orphaned functionCall sitting in history with no reply. A
+    // model that later sees its own unanswered call tends to treat it as already "said" and
+    // drift into narrating outcomes as text instead of calling tools — this loop must resolve
+    // and answer every call from one response, not just the first.
+    const calls = (response.functionCalls || []).filter((c) => isDndAction(c.name));
+    if (!calls.length) {
       const text = response.text?.trim();
       if (!text) throw new Error("Empty response from Gemini");
       return { done: true, text: prependReveals(monsterAttackReveals, text) };
     }
 
-    const resultText = await runDndAction(call.name, call.args, { channelId });
+    // A genuine skill_check pauses the whole turn for the player's 🎲 reveal. Any OTHER calls
+    // bundled in the same batch still get resolved right now — they're just held alongside the
+    // skill_check's (already-rolled, not-yet-revealed) result until the reveal happens, so all
+    // of them can go back together as one functionResponse turn, matching how they arrived.
+    // Only pause on a skill_check that actually rolled — if it errored (bad args, character not
+    // found) there's nothing to reveal, so feed the error straight back like any other tool
+    // call and let Gemini retry/self-correct within this same turn. If more than one skill_check
+    // somehow lands in one batch (rare), only the first pauses for a visible reveal; any further
+    // one is just resolved immediately without its own roll prompt.
+    let pausingCall = null;
+    let pausingResultText = null;
+    const resolvedParts = [];
+    for (const call of calls) {
+      const resultText = await runDndAction(call.name, call.args, { channelId });
 
-    if (call.name === "monster_attack" && resultText.startsWith("OK:")) {
-      monsterAttackReveals.push(formatMonsterAttackReveal(resultText));
+      if (call.name === "monster_attack" && resultText.startsWith("OK:")) {
+        monsterAttackReveals.push(formatMonsterAttackReveal(resultText));
+      }
+
+      if (!pausingCall && call.name === "skill_check" && resultText.startsWith("OK:")) {
+        pausingCall = call;
+        pausingResultText = resultText;
+        continue;
+      }
+
+      resolvedParts.push({ functionResponse: { name: call.name, response: { output: resultText } } });
     }
 
-    // Only pause for a genuine roll — if skill_check itself errored (bad args, character not
-    // found, etc.) there's nothing to reveal, so feed the error straight back like any other
-    // tool call and let Gemini retry/self-correct within this same turn instead of showing the
-    // player a roll prompt that would just reveal "ERROR: ..." when clicked.
-    if (call.name === "skill_check" && resultText.startsWith("OK:")) {
+    if (pausingCall) {
       return {
         done: false,
         pending: {
-          resultText,
-          call,
+          resultText: pausingResultText,
+          call: pausingCall,
           // Same required pattern as askAyame's function-calling follow-up: replay
           // response.candidates[0].content verbatim to preserve Gemini 3's thoughtSignature.
           contents: [...contents, response.candidates[0].content],
+          siblingResponseParts: resolvedParts,
           systemInstruction,
           tools,
           nextStep: step + 1,
@@ -328,11 +355,7 @@ async function runDndLoop(channelId, contents, systemInstruction, tools, startSt
       };
     }
 
-    contents = [
-      ...contents,
-      response.candidates[0].content,
-      { role: "user", parts: [{ functionResponse: { name: call.name, response: { output: resultText } } }] },
-    ];
+    contents = [...contents, response.candidates[0].content, { role: "user", parts: resolvedParts }];
   }
 
   // Hit the step cap — ask once more with tools withheld so the model is forced to produce
@@ -575,7 +598,12 @@ async function resolvePendingDndRoll(channelId, resolvingUsername) {
     ...pending.contents,
     {
       role: "user",
-      parts: [{ functionResponse: { name: pending.call.name, response: { output: pending.resultText } } }],
+      parts: [
+        // Any other calls bundled alongside this skill_check in the same batch (see
+        // runDndLoop) were already resolved and are waiting to be answered together with it.
+        ...(pending.siblingResponseParts || []),
+        { functionResponse: { name: pending.call.name, response: { output: pending.resultText } } },
+      ],
     },
   ];
   const result = await runDndLoop(
