@@ -48,6 +48,7 @@ import {
   getCharacterSheet,
   createCharacter,
   buildPartyStatusText,
+  formatItemLabel,
   trainStat,
   STAT_CAP,
 } from "./dnd.js";
@@ -89,6 +90,8 @@ const DND_HOW_TO_MESSAGE = `**How to play D&D with Ayame~**
 **3.** Just talk! No @ mention needed — say what your character does ("I search the room", "I attack the goblin", "I try to persuade the guard"). Ayame rolls real dice against your actual stats behind the scenes.
 
 **4.** Fight monsters, loot, shop, and level up — HP, gold, inventory, and EXP are all tracked for real, not just narrated.
+
+**4.5.** Hit 0 HP and you're dead — no more acting until revived. Get a party spellcaster to attempt resurrection magic, pay a temple's fee back in a safe town, or retire the character and \`/create_character\` a new one to rejoin.
 
 **5.** Want a quick roll outside the story? \`/dnd roll notation:1d20+3\`.
 
@@ -419,13 +422,15 @@ const DND_HISTORY_KEEP_RECENT = 10;
 
 // Condenses `turnsToCompact` (oldest entries about to be dropped from session.history) plus any
 // existing summary into an updated recap. Deliberately not run through askAyameDnd/Ayame's
-// persona — this is a plain, no-roleplay task, and reuses GEMINI_GROUNDING_MODEL (already the
-// "cheap, fast, task-only" model in this codebase) rather than the main persona model, since
-// it fires periodically in the background rather than once per turn. Returns null (not the old
-// summary) on failure — a distinct signal so the caller knows NOT to compact history this turn:
-// silently keeping the old summary while still trimming history would quietly delete whatever
-// happened in `turnsToCompact` with nothing recording it, which defeats the entire point of
-// summarizing instead of just dropping old turns.
+// persona — this is a plain, no-roleplay task, so it skips the persona system instruction —
+// but it DOES run on GEMINI_MODEL (the main text model), not GEMINI_GROUNDING_MODEL: this task
+// never needs search grounding, and GEMINI_GROUNDING_MODEL is specifically the scarce one (see
+// its free-tier quota note above fetchGroundedContext) — burning it here for a plain
+// summarization task would compete with actual search-grounding requests for no reason. Returns
+// null (not the old summary) on failure — a distinct signal so the caller knows NOT to compact
+// history this turn: silently keeping the old summary while still trimming history would
+// quietly delete whatever happened in `turnsToCompact` with nothing recording it, which defeats
+// the entire point of summarizing instead of just dropping old turns.
 async function summarizeDndHistory(oldSummary, turnsToCompact) {
   const transcript = turnsToCompact
     .map((turn) => `${turn.role === "user" ? "Player" : "Ayame"}: ${turn.parts?.[0]?.text ?? ""}`)
@@ -441,7 +446,7 @@ async function summarizeDndHistory(oldSummary, turnsToCompact) {
 
   try {
     const res = await ai.models.generateContent({
-      model: GEMINI_GROUNDING_MODEL,
+      model: GEMINI_MODEL,
       contents: [{ role: "user", parts: [{ text: prompt }] }],
       config: {
         systemInstruction: "You condense tabletop RPG session logs into compact recaps. No roleplay, no persona — just an accurate, concise summary.",
@@ -491,15 +496,16 @@ function buildStatBar(current, max, length = 10) {
 // /dnd stat's character sheet card.
 function buildCharacterSheetEmbed(sheet, requestedBy) {
   const { username, character: c, inventory, gold } = sheet;
+  const isDead = c.currentHp <= 0;
   const label = c.name ? `${c.name} (${username})` : username;
-  const inventoryText = inventory.length ? inventory.map((i) => `• ${i.item} x${i.quantity}`).join("\n") : "_Empty_";
+  const inventoryText = inventory.length ? inventory.map((i) => `• ${formatItemLabel(i)}`).join("\n") : "_Empty_";
 
   const embed = new EmbedBuilder()
-    .setColor(0xf7b8d2)
-    .setTitle(`📜 ${label}`)
+    .setColor(isDead ? 0x5a5a5a : 0xf7b8d2)
+    .setTitle(`${isDead ? "💀" : "📜"} ${label}${isDead ? " — DEAD" : ""}`)
     .setDescription(`**${c.class}** — Level ${c.level}`)
     .addFields(
-      { name: "❤️ HP", value: `${buildStatBar(c.currentHp, c.maxHp)}\n${c.currentHp}/${c.maxHp}`, inline: true },
+      { name: "❤️ HP", value: `${buildStatBar(c.currentHp, c.maxHp)}\n${c.currentHp}/${c.maxHp}${isDead ? " — needs reviving to act again" : ""}`, inline: true },
       { name: "✨ EXP", value: `${c.exp}/${c.level * 100}`, inline: true },
       { name: "💰 Gold", value: `${gold}`, inline: true },
       {
@@ -1088,9 +1094,10 @@ client.on("interactionCreate", async (interaction) => {
     const name = interaction.options.getString("name");
     const characterClass = interaction.options.getString("class", true);
     const background = interaction.options.getString("background");
-    await createCharacter(channelId, interaction.user.username, interaction.user.id, stats, name, characterClass, background);
+    const created = await createCharacter(channelId, interaction.user.username, interaction.user.id, stats, name, characterClass, background);
     await interaction.reply(
       `Character created! ${name ? `**${name}** — ` : ""}${characterClass}, Lvl 1, ${10 + stats.con} HP, 50 gold to start.` +
+        ` Starting gear: ${created.starterItems.join(", ")}.` +
         (background ? ` Backstory noted~` : "") +
         ` Good luck out there~`
     );

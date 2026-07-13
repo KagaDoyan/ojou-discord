@@ -21,6 +21,8 @@ import {
   STAT_CAP,
 } from "./dndMechanics.js";
 
+const TEST_STARTER_GOLD = 50;
+
 const CHANNEL = `__mechanics_test_${Date.now()}__`;
 
 let pass = 0;
@@ -50,8 +52,8 @@ async function main() {
     null
   );
   let c = getCharacter(CHANNEL, "alice");
-  assertEqual(c.maxHp, 30, "starting maxHp = 10 + con(20)");
-  assertEqual(c.currentHp, 30, "starting currentHp = maxHp");
+  assertEqual(c.maxHp, 40, "starting maxHp = 20 + con(20)");
+  assertEqual(c.currentHp, 40, "starting currentHp = maxHp");
   assertEqual(c.level, 1, "starting level");
   assertEqual(c.exp, 0, "starting exp");
 
@@ -59,16 +61,62 @@ async function main() {
   let r = await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: 10 }, { channelId: CHANNEL });
   assert(r.startsWith("OK:"), "apply_damage player damage returns OK: " + r);
   c = getCharacter(CHANNEL, "alice");
-  assertEqual(c.currentHp, 20, "HP after 10 damage");
+  assertEqual(c.currentHp, 30, "HP after 10 damage (40 - 10)");
 
   r = await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: 1000 }, { channelId: CHANNEL });
   c = getCharacter(CHANNEL, "alice");
   assertEqual(c.currentHp, 0, "HP clamps at 0, not negative");
-  assert(r.includes("knocked unconscious"), "massive damage reports knocked unconscious");
+  assert(r.includes("DEAD"), "massive damage reports DEAD: " + r);
 
-  r = await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: -1000 }, { channelId: CHANNEL });
+  // --- death gating: a dead (0 HP) character can't act, can't be targeted, and can't be
+  // healed back by ordinary means — only revive_character moves their HP again ---
+  r = await runMechanicsAction("skill_check", { player_name: "alice", stat: "str", difficulty: "easy" }, { channelId: CHANNEL });
+  assert(r.startsWith("ERROR:") && r.includes("down"), "a dead character can't skill_check: " + r);
+
+  r = await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: -20 }, { channelId: CHANNEL });
+  assert(r.startsWith("ERROR:") && r.includes("revive_character"), "ordinary healing can't revive a dead character: " + r);
+
+  r = await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: 5 }, { channelId: CHANNEL });
   c = getCharacter(CHANNEL, "alice");
-  assertEqual(c.currentHp, c.maxHp, "healing clamps at maxHp, doesn't overheal");
+  assertEqual(c.currentHp, 0, "further damage on an already-dead character is a no-op");
+
+  await runMechanicsAction("spawn_monster", { name: "TestGoblin", max_hp: 10 }, { channelId: CHANNEL });
+  r = await runMechanicsAction("monster_attack", { monster_name: "TestGoblin", target_player_name: "alice", defense_stat: "con" }, { channelId: CHANNEL });
+  assert(r.startsWith("ERROR:"), "a dead character can't be targeted by monster_attack: " + r);
+
+  // --- revive_character: free resurrection magic (cost 0) ---
+  r = await runMechanicsAction("revive_character", { player_name: "alice", hp_restored: 20, cost: 0 }, { channelId: CHANNEL });
+  assert(r.startsWith("OK:") && r.includes("no cost"), "free resurrection magic revives with no gold cost: " + r);
+  c = getCharacter(CHANNEL, "alice");
+  assertEqual(c.currentHp, 20, "revived at the given hp_restored amount");
+
+  r = await runMechanicsAction("revive_character", { player_name: "alice", hp_restored: 10, cost: 0 }, { channelId: CHANNEL });
+  assert(r.startsWith("ERROR:") && r.includes("still alive"), "reviving an already-alive character errors: " + r);
+
+  // --- revive_character: paid temple service (cost > 0) ---
+  await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: 1000 }, { channelId: CHANNEL });
+  r = await runMechanicsAction("revive_character", { player_name: "alice", hp_restored: 40, cost: 100000 }, { channelId: CHANNEL });
+  assert(r.startsWith("ERROR:") && r.includes("afford"), "revival fee the payer can't afford errors: " + r);
+  c = getCharacter(CHANNEL, "alice");
+  assertEqual(c.currentHp, 0, "still dead after a failed paid revival");
+
+  r = await runMechanicsAction("revive_character", { player_name: "alice", hp_restored: 40, cost: 20 }, { channelId: CHANNEL });
+  assert(r.startsWith("OK:"), "paid temple revival succeeds when affordable: " + r);
+  c = getCharacter(CHANNEL, "alice");
+  assertEqual(c.currentHp, 40, "revived to full HP by the paid service");
+  let sheetAfterPaidRevive = getCharacterSheet(CHANNEL, "alice");
+  assertEqual(sheetAfterPaidRevive.gold, TEST_STARTER_GOLD - 20, "revival fee deducted from the revived character's own gold by default");
+
+  // --- revive_character: payer_name lets a party member cover the fee instead ---
+  await createCharacter(CHANNEL, "bob", "uid-bob", { str: 15, dex: 15, con: 15, int: 15, wis: 15, cha: 25 }, "Bob", "Cleric", null);
+  await runMechanicsAction("modify_wallet", { player_name: "bob", amount: 50 }, { channelId: CHANNEL });
+  await runMechanicsAction("apply_damage", { target_type: "player", target_name: "alice", amount: 1000 }, { channelId: CHANNEL });
+  r = await runMechanicsAction("revive_character", { player_name: "alice", hp_restored: 15, cost: 30, payer_name: "bob" }, { channelId: CHANNEL });
+  assert(r.startsWith("OK:") && r.includes("bob paid 30 gold"), "payer_name lets another character cover the revival fee: " + r);
+  const bobSheet = getCharacterSheet(CHANNEL, "bob");
+  assertEqual(bobSheet.gold, 70, "payer's own gold is deducted (50 starting + 50 - 30)");
+  const aliceSheetAfterPayerRevive = getCharacterSheet(CHANNEL, "alice");
+  assertEqual(aliceSheetAfterPayerRevive.gold, sheetAfterPaidRevive.gold, "revived character's own gold untouched when payer_name covers the fee");
 
   // --- spawn_monster + apply_damage (monster HP) ---
   r = await runMechanicsAction("spawn_monster", { name: "Goblin", max_hp: 15 }, { channelId: CHANNEL });
@@ -86,8 +134,8 @@ async function main() {
   c = getCharacter(CHANNEL, "alice");
   assertEqual(c.level, 2, "level after 250 exp (100 to hit lvl2, 150 left)");
   assertEqual(c.exp, 150, "exp remainder after leveling to 2");
-  assertEqual(c.maxHp, 35, "maxHp +5 on level up");
-  assertEqual(c.currentHp, 35, "currentHp fully restored on level up");
+  assertEqual(c.maxHp, 45, "maxHp +5 on level up");
+  assertEqual(c.currentHp, 45, "currentHp fully restored on level up");
   assertEqual(c.unspentStatPoints, 1, "1 unspent stat point after single level up");
   assert(r.includes("LEVEL UP"), "add_exp reports LEVEL UP: " + r);
 
@@ -132,12 +180,15 @@ async function main() {
   assertEqual(c.stats.cha, 0, "modify_character_stat floors at 0");
 
   // --- wallet ---
+  // Alice's gold is 30 here, not the 50 she started with — the paid temple revival tested
+  // above spent 20 of it (the payer_name revival test that followed paid from bob's gold, not
+  // hers, so it didn't touch this balance further).
   let sheet = getCharacterSheet(CHANNEL, "alice");
-  assertEqual(sheet.gold, 50, "starting gold");
+  assertEqual(sheet.gold, TEST_STARTER_GOLD - 20, "gold after the earlier paid revival (50 - 20)");
 
   r = await runMechanicsAction("modify_wallet", { player_name: "alice", amount: 25 }, { channelId: CHANNEL });
   sheet = getCharacterSheet(CHANNEL, "alice");
-  assertEqual(sheet.gold, 75, "gold after +25");
+  assertEqual(sheet.gold, 55, "gold after +25 (30 + 25)");
 
   r = await runMechanicsAction("modify_wallet", { player_name: "alice", amount: -1000 }, { channelId: CHANNEL });
   sheet = getCharacterSheet(CHANNEL, "alice");
@@ -158,12 +209,14 @@ async function main() {
   assert(r.startsWith("ERROR:"), "removing an item you don't have errors: " + r);
 
   // --- shop: buy/sell (atomic gold+item together) ---
+  // Alice is a Warrior, so createCharacter already granted her a starting Sword (qty 1) —
+  // buy/sell quantities below are relative to that baseline, not zero.
   await runMechanicsAction("modify_wallet", { player_name: "alice", amount: 100 }, { channelId: CHANNEL });
   r = await runMechanicsAction("buy_item", { player_name: "alice", item_name: "Sword", price: 30, quantity: 2 }, { channelId: CHANNEL });
   assert(r.startsWith("OK:"), "buy_item succeeds when affordable: " + r);
   sheet = getCharacterSheet(CHANNEL, "alice");
   assertEqual(sheet.gold, 40, "gold deducted correctly on buy (100 - 60)");
-  assertEqual(sheet.inventory.find((i) => i.item === "Sword")?.quantity, 2, "bought item added to inventory");
+  assertEqual(sheet.inventory.find((i) => i.item === "Sword")?.quantity, 3, "bought item added to starting inventory (1 starter + 2 bought)");
 
   r = await runMechanicsAction("buy_item", { player_name: "alice", item_name: "Castle", price: 10000, quantity: 1 }, { channelId: CHANNEL });
   assert(r.startsWith("ERROR:"), "buy_item rejects an unaffordable purchase: " + r);
@@ -174,10 +227,68 @@ async function main() {
   assert(r.startsWith("OK:"), "sell_item succeeds: " + r);
   sheet = getCharacterSheet(CHANNEL, "alice");
   assertEqual(sheet.gold, 55, "gold added correctly on sell (40 + 15)");
-  assertEqual(sheet.inventory.find((i) => i.item === "Sword")?.quantity, 1, "sold quantity deducted from inventory");
+  assertEqual(sheet.inventory.find((i) => i.item === "Sword")?.quantity, 2, "sold quantity deducted from inventory (3 - 1)");
 
   r = await runMechanicsAction("sell_item", { player_name: "alice", item_name: "Sword", price: 15, quantity: 5 }, { channelId: CHANNEL });
   assert(r.startsWith("ERROR:"), "selling more than you have errors: " + r);
+
+  // --- equipment: starter gear is pre-tagged, item_used applies a weapon bonus only when it
+  // fits the stat rolled, armor/shield apply passively in monster_attack ---
+  sheet = getCharacterSheet(CHANNEL, "alice");
+  const swordEntry = sheet.inventory.find((i) => i.item === "Sword");
+  assertEqual(swordEntry.equipType, "weapon", "starter Sword is tagged as a weapon");
+  assertEqual(swordEntry.equipTier, "standard", "starter Sword defaults to standard tier");
+  assert(swordEntry.equipStats.includes("str") && !swordEntry.equipStats.includes("dex"), "starter Sword suits str, not dex");
+  const shieldEntry = sheet.inventory.find((i) => i.item === "Shield");
+  assertEqual(shieldEntry.equipType, "shield", "starter Shield is tagged as a shield");
+
+  // Alice's str is STAT_CAP (40, trained earlier) -> stat modifier +8. Standard-tier weapon
+  // bonus is +2 — the result string shows both components separately (not pre-summed), so this
+  // is deterministic even though the die roll itself is random.
+  r = await runMechanicsAction("skill_check", { player_name: "alice", stat: "str", difficulty: "easy", item_used: "Sword" }, { channelId: CHANNEL });
+  assert(r.includes("+8 (STR) +2 (Sword)"), "matching weapon bonus shows both the stat and item components separately: " + r);
+
+  r = await runMechanicsAction("skill_check", { player_name: "alice", stat: "dex", difficulty: "easy", item_used: "Sword" }, { channelId: CHANNEL });
+  assert(!r.includes("(Sword)"), "weapon bonus does NOT apply when the stat doesn't fit the weapon: " + r);
+
+  r = await runMechanicsAction("skill_check", { player_name: "alice", stat: "str", difficulty: "easy", item_used: "Warhammer of Doom" }, { channelId: CHANNEL });
+  assert(r.startsWith("ERROR:") && r.includes("doesn't have"), "item_used naming an unowned item errors (possession check): " + r);
+
+  // Alice's con is untouched at 20 -> defense modifier floor(20/5)=4, base DC 14; her starter
+  // Shield (standard tier, +2) should passively raise that to 16 with no tool call needed for it.
+  await runMechanicsAction("spawn_monster", { name: "EquipTestMonster", max_hp: 10 }, { channelId: CHANNEL });
+  r = await runMechanicsAction("monster_attack", { monster_name: "EquipTestMonster", target_player_name: "alice", defense_stat: "con" }, { channelId: CHANNEL });
+  assert(r.includes("DC 16, +2 Shield"), "shield bonus passively raises the defense DC in monster_attack: " + r);
+
+  // add_item/buy_item with explicit equip fields on a brand-new item name.
+  r = await runMechanicsAction(
+    "add_item",
+    { player_name: "alice", item_name: "Frostbrand", equip_type: "weapon", equip_stats: ["str"], equip_tier: "legendary" },
+    { channelId: CHANNEL }
+  );
+  assert(r.startsWith("OK:"), "add_item with equip fields succeeds: " + r);
+  sheet = getCharacterSheet(CHANNEL, "alice");
+  const frostbrand = sheet.inventory.find((i) => i.item === "Frostbrand");
+  assertEqual(frostbrand.equipTier, "legendary", "add_item stores the given equip_tier");
+  r = await runMechanicsAction("skill_check", { player_name: "alice", stat: "str", difficulty: "easy", item_used: "Frostbrand" }, { channelId: CHANNEL });
+  assert(r.includes("+8 (STR) +4 (Frostbrand)"), "legendary tier grants +4 instead of the standard +2: " + r);
+
+  // Invalid equip_type is silently dropped rather than erroring the whole grant.
+  r = await runMechanicsAction("add_item", { player_name: "alice", item_name: "Plain Rock", equip_type: "not_a_real_type" }, { channelId: CHANNEL });
+  assert(r.startsWith("OK:"), "an invalid equip_type doesn't block the item grant: " + r);
+  sheet = getCharacterSheet(CHANNEL, "alice");
+  assertEqual(sheet.inventory.find((i) => i.item === "Plain Rock").equipType, undefined, "invalid equip_type is dropped, item stored as ordinary");
+
+  // Stacking more of an already-owned equipped item doesn't overwrite its existing equip fields.
+  r = await runMechanicsAction(
+    "add_item",
+    { player_name: "alice", item_name: "Sword", quantity: 1, equip_type: "weapon", equip_stats: ["dex"], equip_tier: "legendary" },
+    { channelId: CHANNEL }
+  );
+  sheet = getCharacterSheet(CHANNEL, "alice");
+  const swordAfterRestack = sheet.inventory.find((i) => i.item === "Sword");
+  assertEqual(swordAfterRestack.equipTier, "standard", "restacking an existing item does not overwrite its original equip fields");
+  assertEqual(swordAfterRestack.quantity, 3, "restacking still adds quantity normally (2 + 1)");
 
   // --- skill_check: structural + statistical sanity (real dice, sampled) ---
   await createCharacter(CHANNEL, "statcheck", "uid-sc", { str: 40, dex: 0, con: 10, int: 10, wis: 10, cha: 10 }, null, "Tester", null);
@@ -203,7 +314,7 @@ async function main() {
   assert(r.startsWith("ERROR:"), "invalid stat name is rejected: " + r);
 
   r = await runMechanicsAction("skill_check", { player_name: "statcheck", stat: "str", difficulty: "easy", required_successes: 5 }, { channelId: CHANNEL });
-  const successCountMatch = r.match(/\((\d+)\/(\d+) succeeded\)/);
+  const successCountMatch = r.match(/(\d+)\/(\d+) succeeded/);
   assert(!!successCountMatch && successCountMatch[2] === "5", "required_successes rolls exactly that many dice: " + r);
 
   // --- monster_attack ---

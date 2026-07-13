@@ -30,6 +30,141 @@ export const STAT_CAP = 40;
 // not calling the tool at all and narrating a refusal when something's flatly absurd for the
 // character. See the CLASS GUARD instructions in persona.js.
 
+// Deterministic starter-kit lookup, keyed by keyword match against the free-text class. Class
+// has no fixed rulebook (see the CLASS GUARD note above), so this is intentionally loose —
+// a handful of common archetypes get flavorful gear, anything else (including sci-fi concepts
+// that don't match a fantasy keyword) falls back to a generic kit. This exists so every
+// character has usable starting gear the instant /create_character runs, rather than waiting on
+// the DM to narrate it in — see STARTER_KIT_FALLBACK for the always-present baseline.
+// Equipment mechanics: a weapon/armor/shield can carry a real mechanical bonus, but WHICH type
+// an item is and how strong it is is never guessed from its name in code — item names are
+// freeform (Gemini or a player might call something "Frostbrand" or "Void Ripper"), so a
+// keyword list would silently miss most of them. Instead the classification is supplied
+// explicitly wherever an item enters inventory — starterKitFor below (fixed, code-authored
+// content, not guessed) and add_item/buy_item's optional equip_type/equip_stats/equip_tier args
+// (Gemini's own judgment, same pattern as spawn_monster's max_hp or skill_check's difficulty) —
+// and stored right on the inventory entry, read back later with no re-guessing involved. See
+// EQUIPMENT_TIER_BONUS for the tier -> numeric bonus mapping, and its two consumers: skillCheck
+// (weapon bonus, opt-in per action via item_used) and gearDefenseBonus/monsterAttack
+// (armor/shield bonus, passive and always-on since defense isn't a per-action choice).
+const EQUIPMENT_TIER_BONUS = { standard: 2, fine: 3, legendary: 4 };
+const DEFAULT_EQUIPMENT_TIER = "standard";
+const EQUIPMENT_TYPES = ["weapon", "armor", "shield"];
+
+function equipmentBonusFor(tier) {
+  return EQUIPMENT_TIER_BONUS[tier] || EQUIPMENT_TIER_BONUS[DEFAULT_EQUIPMENT_TIER];
+}
+
+// Normalizes add_item/buy_item's optional equip_type/equip_stats/equip_tier args into the
+// fields stored on a new inventory entry — silently drops anything invalid (unrecognized type,
+// bad tier, stats not in VALID_STATS) rather than erroring, since equipment is an enhancement on
+// top of a normal item grant, not something that should block the grant itself. Returns {} for
+// a non-equipment item (equip_type omitted), so spreading it onto the stored entry is a no-op.
+function buildEquipFields(equipType, equipStats, equipTier) {
+  if (!EQUIPMENT_TYPES.includes(equipType)) return {};
+  const tier = EQUIPMENT_TIER_BONUS[equipTier] ? equipTier : DEFAULT_EQUIPMENT_TIER;
+  const stats = Array.isArray(equipStats) ? equipStats.filter((s) => VALID_STATS.includes(s)) : [];
+  return { equipType, equipStats: stats, equipTier: tier };
+}
+
+const STARTER_KITS = [
+  {
+    keywords: ["warrior", "knight", "fighter", "paladin", "barbarian", "soldier", "guard"],
+    items: [
+      { name: "Sword", equipType: "weapon", equipStats: ["str"] },
+      { name: "Shield", equipType: "shield" },
+    ],
+  },
+  {
+    keywords: ["rogue", "thief", "assassin", "bandit"],
+    items: [
+      { name: "Dagger", equipType: "weapon", equipStats: ["str", "dex"] },
+      { name: "Lockpick Set" },
+    ],
+  },
+  {
+    keywords: ["mage", "wizard", "sorcerer", "witch", "warlock"],
+    items: [
+      { name: "Wand", equipType: "weapon", equipStats: ["int", "wis", "cha"] },
+      { name: "Spellbook" },
+    ],
+  },
+  {
+    keywords: ["archer", "ranger", "hunter"],
+    items: [
+      { name: "Shortbow", equipType: "weapon", equipStats: ["dex"] },
+      { name: "Quiver of Arrows" },
+    ],
+  },
+  {
+    keywords: ["healer", "cleric", "priest", "monk"],
+    items: [
+      { name: "Healing Herbs" },
+      { name: "Holy Symbol", equipType: "weapon", equipStats: ["int", "wis", "cha"] },
+    ],
+  },
+  {
+    keywords: ["bard", "singer", "performer"],
+    items: [
+      { name: "Lute", equipType: "weapon", equipStats: ["cha"] },
+      { name: "Dagger", equipType: "weapon", equipStats: ["str", "dex"] },
+    ],
+  },
+  {
+    keywords: ["hacker", "engineer", "technician", "mechanic"],
+    items: [{ name: "Multitool" }, { name: "Datapad" }],
+  },
+  {
+    keywords: ["pilot", "trooper", "marine", "cyber", "gunner"],
+    items: [
+      { name: "Blaster Pistol", equipType: "weapon", equipStats: ["dex"] },
+      { name: "Combat Vest", equipType: "armor" },
+    ],
+  },
+];
+const STARTER_KIT_FALLBACK = [{ name: "Traveler's Pack" }, { name: "Torch" }];
+
+// Turns a STARTER_KITS entry into real inventory rows (item/quantity/equip fields), ready to
+// store directly — starter gear is always DEFAULT_EQUIPMENT_TIER ("standard"), better gear is
+// something a character finds/buys/is granted later via add_item/buy_item's equip_tier arg.
+function starterKitFor(characterClass) {
+  const lower = (characterClass || "").toLowerCase();
+  const matched = STARTER_KITS.find((kit) => kit.keywords.some((word) => lower.includes(word)));
+  const picks = [...(matched ? matched.items : STARTER_KIT_FALLBACK), { name: "Rations" }];
+  return picks.map(({ name, equipType, equipStats }) => ({
+    item: name,
+    quantity: 1,
+    ...(equipType ? { equipType, equipStats: equipStats || [], equipTier: DEFAULT_EQUIPMENT_TIER } : {}),
+  }));
+}
+
+// Best armor bonus + best shield bonus currently in a character's inventory (each slot counted
+// once — carrying two shields doesn't stack, but armor and a shield are separate slots and both
+// apply). Used by monsterAttack to passively raise the defense DC; no tool call needed for this,
+// unlike a weapon's item_used opt-in, since what you're wearing isn't a per-action choice.
+function gearDefenseBonus(items) {
+  let armorBonus = 0;
+  let armorName = null;
+  let shieldBonus = 0;
+  let shieldName = null;
+  for (const it of items) {
+    if (!it.equipType) continue;
+    const bonus = equipmentBonusFor(it.equipTier);
+    if (it.equipType === "armor" && bonus > armorBonus) {
+      armorBonus = bonus;
+      armorName = it.item;
+    }
+    if (it.equipType === "shield" && bonus > shieldBonus) {
+      shieldBonus = bonus;
+      shieldName = it.item;
+    }
+  }
+  const parts = [];
+  if (armorName) parts.push(`+${armorBonus} ${armorName}`);
+  if (shieldName) parts.push(`+${shieldBonus} ${shieldName}`);
+  return { bonus: armorBonus + shieldBonus, label: parts.length ? `, ${parts.join(" + ")}` : "" };
+}
+
 export async function loadMechanicsState() {
   await Promise.all([characters.load(), inventories.load(), wallets.load(), monsters.load()]);
 }
@@ -128,7 +263,10 @@ export async function createCharacter(
   background = null
 ) {
   const con = Number(stats.con) || 0;
-  const maxHp = 10 + con;
+  // Base bumped from 10 to 20 (see the HP-balance discussion this came out of) — 10+con let a
+  // low-con build start as low as 10 HP, which combined with freeform monster damage made a
+  // two-hit kill in the very first encounter routine instead of a rare bad-luck outcome.
+  const maxHp = 20 + con;
   const charBucket = getChannelBucket(characters, channelId);
   charBucket[username] = {
     name,
@@ -149,11 +287,24 @@ export async function createCharacter(
     maxHp,
     currentHp: maxHp,
   };
-  getChannelBucket(inventories, channelId)[username] = [];
+  const starterKit = starterKitFor(characterClass);
+  getChannelBucket(inventories, channelId)[username] = starterKit;
   getChannelBucket(wallets, channelId)[username] = STARTING_GOLD;
 
   await Promise.all([characters.scheduleSave(), inventories.scheduleSave(), wallets.scheduleSave()]);
-  return charBucket[username];
+  return { ...charBucket[username], starterItems: starterKit.map((i) => i.item) };
+}
+
+// Shared by buildPartyStatusText below and the /dnd stat embed (index.js) so both surfaces show
+// an equipped item's bonus without either one re-deriving it — the DM sees at a glance which
+// carried items are actually worth passing to skill_check's item_used, instead of needing to
+// remember what was granted with what equip_type/equip_tier turns ago.
+export function formatItemLabel(item) {
+  const base = `${item.item} x${item.quantity}`;
+  if (!item.equipType) return base;
+  const bonus = equipmentBonusFor(item.equipTier);
+  const statsPart = item.equipType === "weapon" && item.equipStats?.length ? `: ${item.equipStats.join("/")}` : "";
+  return `${base} [${item.equipType}${statsPart}, ${item.equipTier}, +${bonus}]`;
 }
 
 // Formats current party + monster state as plain text, injected into the D&D system prompt
@@ -166,7 +317,7 @@ export function buildPartyStatusText(channelId) {
   const mons = monsters.data.get(channelId) || {};
 
   const partyLines = Object.entries(chars).map(([username, c]) => {
-    const items = (inv[username] || []).map((i) => `${i.item} x${i.quantity}`).join(", ") || "empty";
+    const items = (inv[username] || []).map(formatItemLabel).join(", ") || "empty";
     const gold = wallet[username] ?? 0;
     // Username leads and is the ONLY thing tool calls should ever use to identify this
     // player — the flavor name is marked "aka" specifically so it reads as secondary, not
@@ -174,7 +325,7 @@ export function buildPartyStatusText(channelId) {
     // player_name/target_name args, which fails to resolve).
     const label = c.name ? `${username} (aka "${c.name}")` : username;
     return (
-      `${label} [${c.class}] — Lvl ${c.level}, HP ${c.currentHp}/${c.maxHp}, EXP ${c.exp}/${c.level * 100}, ` +
+      `${label} [${c.class}] — Lvl ${c.level}, HP ${c.currentHp}/${c.maxHp}${c.currentHp <= 0 ? " (DEAD — needs revive_character)" : ""}, EXP ${c.exp}/${c.level * 100}, ` +
       `STR ${c.stats.str}/DEX ${c.stats.dex}/CON ${c.stats.con}/INT ${c.stats.int}/WIS ${c.stats.wis}/CHA ${c.stats.cha}, ` +
       `Gold ${gold}, Inventory: ${items}` +
       (c.background ? `, Background: ${c.background}` : "") +
@@ -236,7 +387,7 @@ function rollD20WithModifier(modifier, dc) {
 // Gemini narrates a refusal in prose instead. A natural 20/1 always succeeds/fails that
 // individual roll outright regardless of DC (a deliberate simplification over strict 5e
 // rules, fitting a light one-shot feel).
-async function skillCheck(channelId, playerName, stat, difficulty, requiredSuccesses) {
+async function skillCheck(channelId, playerName, stat, difficulty, requiredSuccesses, itemUsed) {
   if (!VALID_STATS.includes(stat)) return `ERROR: stat must be one of ${VALID_STATS.join(", ")}.`;
   if (!DIFFICULTY_DC[difficulty]) return `ERROR: difficulty must be one of ${Object.keys(DIFFICULTY_DC).join(", ")}.`;
 
@@ -248,7 +399,34 @@ async function skillCheck(channelId, playerName, stat, difficulty, requiredSucce
   if (!key) return `ERROR: no character found for "${playerName}".`;
 
   const character = bucket[key];
-  const modifier = Math.floor(character.stats[stat] / 5);
+  if (character.currentHp <= 0) {
+    return `ERROR: ${key} is down (0 HP) and can't act until revived — see revive_character.`;
+  }
+
+  // item_used is optional — only present when the DM says this action is specifically wielding
+  // a carried item. Doubles as a code-enforced possession check (errors if they don't actually
+  // have it), and only adds a bonus if that item was stored as a weapon fit for this stat (see
+  // equip_type/equip_stats on add_item/buy_item, or starterKitFor for starting gear) — naming a
+  // non-weapon item (a torch, a lockpick set) is valid and doesn't error, it just adds no bonus.
+  let itemBonus = 0;
+  let itemName = null;
+  if (itemUsed) {
+    const invBucket = inventories.data.get(channelId) || {};
+    const owned = (invBucket[key] || []).find((i) => i.item.toLowerCase() === itemUsed.toLowerCase());
+    if (!owned) return `ERROR: ${key} doesn't have "${itemUsed}" — can't use it for this check.`;
+    if (owned.equipType === "weapon" && (owned.equipStats || []).includes(stat)) {
+      itemBonus = equipmentBonusFor(owned.equipTier);
+      itemName = owned.item;
+    }
+  }
+
+  // Kept separate from itemBonus (rather than pre-summed) purely so the result string below can
+  // show each contributing piece on its own — stat bonus and item bonus read as one opaque
+  // number otherwise, which is the exact confusion this format replaced (see the readability
+  // discussion this came out of: a player couldn't tell how much of a roll's modifier was their
+  // stat vs. their weapon).
+  const statModifier = Math.floor(character.stats[stat] / 5);
+  const modifier = statModifier + itemBonus;
 
   const rolls = [];
   let allSucceeded = true;
@@ -257,15 +435,19 @@ async function skillCheck(channelId, playerName, stat, difficulty, requiredSucce
     rolls.push(outcome);
     if (!outcome.success) allSucceeded = false;
   }
-
-  const rollSummary = rolls
-    .map((r) => `${r.roll}${r.modifierText}=${r.total}${r.success ? "✓" : "✗"}${r.flavor}`)
-    .join(", ");
   const successCount = rolls.filter((r) => r.success).length;
 
+  const statLabel = stat.toUpperCase();
+  const statPart = `${statModifier >= 0 ? "+" : ""}${statModifier} (${statLabel})`;
+  const itemPart = itemBonus ? ` +${itemBonus} (${itemName})` : "";
+  const rollBreakdowns = rolls.map((r) => `${r.roll} ${statPart}${itemPart} = ${r.total}${r.success ? " ✓" : " ✗"}${r.flavor}`);
+
+  const needText = `need ${dc} to succeed${count > 1 ? ` (all ${count} rolls must succeed)` : ""}`;
+  const rolledText = count > 1 ? `rolled: ${rollBreakdowns.join("; ")}` : `rolled ${rollBreakdowns[0]}`;
+
   return (
-    `OK: ${key}'s ${stat.toUpperCase()} check (DC ${dc}${count > 1 ? `, needed ${count}/${count} successes` : ""}) ` +
-    `— [${rollSummary}] (${successCount}/${count} succeeded) — ${allSucceeded ? "SUCCESS" : "FAILURE"}.`
+    `OK: ${key}'s ${statLabel} check — ${needText} — ${rolledText} — ` +
+    `${count > 1 ? `${successCount}/${count} succeeded — ` : ""}${allSucceeded ? "SUCCESS" : "FAILURE"}.`
   );
 }
 
@@ -293,10 +475,22 @@ async function applyDamage(channelId, targetType, targetName, amount, reason) {
     const key = findCharacterKey(bucket, targetName);
     if (!key) return `ERROR: no character found for "${targetName}".`;
     const character = bucket[key];
+
+    // A character already at 0 HP is dead, not just hurt — ordinary damage/healing no longer
+    // moves their HP. More damage is a no-op (nothing left to lose), and healing must go
+    // through revive_character instead (magic resurrection or a paid temple service), so death
+    // stays a real, deliberate beat rather than something a routine heal quietly undoes.
+    if (character.currentHp <= 0) {
+      if (amount <= 0) {
+        return `ERROR: ${key} is dead (0 HP) — ordinary healing can't bring them back. Use revive_character (resurrection magic, or a temple's paid service) instead.`;
+      }
+      return `OK: ${key} is already down (0 HP) — unaffected by further damage.`;
+    }
+
     character.currentHp = Math.min(character.maxHp, Math.max(0, character.currentHp - amount));
     await characters.scheduleSave();
     const downed = character.currentHp <= 0;
-    return `OK: ${key} ${verb} ${magnitude} ${noun} (${character.currentHp}/${character.maxHp} HP)${downed ? " — knocked unconscious!" : ""}.`;
+    return `OK: ${key} ${verb} ${magnitude} ${noun} (${character.currentHp}/${character.maxHp} HP)${downed ? " — DEAD (0 HP)! Out of action until revived — see revive_character." : ""}.`;
   }
 
   return 'ERROR: target_type must be "monster" or "player".';
@@ -320,18 +514,66 @@ async function monsterAttack(channelId, monsterName, targetPlayerName, defenseSt
   const targetKey = findCharacterKey(charBucket, targetPlayerName);
   if (!targetKey) return `ERROR: no character found for "${targetPlayerName}".`;
   const target = charBucket[targetKey];
+  if (target.currentHp <= 0) return `ERROR: ${targetKey} is already down (0 HP) — pick a different target.`;
 
   // Attack bonus ties directly to the toughness (maxHp) Gemini already judged at spawn_monster
   // time — no separate field for her to independently decide and risk being inconsistent
-  // about. Defense DC comes from the target's real stored stat, same modifier scale as
-  // skill_check — deterministic on both sides of the roll.
+  // about. Defense DC comes from the target's real stored stat plus any armor/shield currently
+  // in their inventory (gearDefenseBonus — passive, no tool call needed for it), same modifier
+  // scale as skill_check — deterministic on both sides of the roll.
   const attackBonus = Math.floor(monster.maxHp / 5);
-  const dc = 10 + Math.floor(target.stats[defenseStat] / 5);
+  const invBucket = inventories.data.get(channelId) || {};
+  const defenseGear = gearDefenseBonus(invBucket[targetKey] || []);
+  const dc = 10 + Math.floor(target.stats[defenseStat] / 5) + defenseGear.bonus;
   const { roll, total, success, flavor, modifierText } = rollD20WithModifier(attackBonus, dc);
 
   return (
-    `OK: ${monsterKey} attacks ${targetKey} (${defenseStat.toUpperCase()} defense, DC ${dc}) — ` +
+    `OK: ${monsterKey} attacks ${targetKey} (${defenseStat.toUpperCase()} defense, DC ${dc}${defenseGear.label}) — ` +
     `rolled ${roll}${modifierText} = ${total} — ${success ? "HIT" : "MISS"}${flavor}.`
+  );
+}
+
+// Brings a dead (0 HP) character back — the only way their HP moves again once they hit 0 (see
+// the dead-state gating in applyDamage/skillCheck/monsterAttack above). Covers both revival
+// paths from the DEATH & REVIVAL persona instructions: a party spellcaster's resurrection magic
+// (cost 0, called after their own successful skill_check) or a temple/priest's paid service back
+// in town (cost > 0). The third path — retiring the character and building a new one via
+// /create_character instead — never touches this tool at all.
+// payer_name lets a party member other than the revived character foot the bill (covering a
+// dead ally's temple fee out of their own pocket); defaults to the revived character's own gold.
+async function reviveCharacter(channelId, playerName, hpRestored, cost, payerName) {
+  hpRestored = Number(hpRestored);
+  cost = Number(cost) || 0;
+  if (!Number.isFinite(hpRestored) || hpRestored <= 0) return "ERROR: revive_character needs a positive hp_restored.";
+  if (cost < 0) return "ERROR: cost can't be negative.";
+
+  const charBucket = getChannelBucket(characters, channelId);
+  const key = findCharacterKey(charBucket, playerName);
+  if (!key) return `ERROR: no character found for "${playerName}".`;
+  const character = charBucket[key];
+  if (character.currentHp > 0) {
+    return `ERROR: ${key} is still alive (${character.currentHp}/${character.maxHp} HP) — no revival needed.`;
+  }
+
+  const walletBucket = getChannelBucket(wallets, channelId);
+  let payerKey = key;
+  if (cost > 0) {
+    if (payerName) {
+      const resolvedPayer = findCharacterKey(charBucket, payerName);
+      if (!resolvedPayer) return `ERROR: no character found for payer "${payerName}".`;
+      payerKey = resolvedPayer;
+    }
+    const balance = walletBucket[payerKey] ?? 0;
+    if (balance < cost) return `ERROR: ${payerKey} can't afford the ${cost} gold revival fee (has ${balance}).`;
+    walletBucket[payerKey] = balance - cost;
+  }
+
+  character.currentHp = Math.min(character.maxHp, hpRestored);
+  await Promise.all([characters.scheduleSave(), wallets.scheduleSave()]);
+  return (
+    `OK: ${key} is revived with ${character.currentHp}/${character.maxHp} HP` +
+    (cost > 0 ? ` (${payerKey} paid ${cost} gold)` : " (no cost)") +
+    "."
   );
 }
 
@@ -422,7 +664,7 @@ async function modifyWallet(channelId, playerName, amount) {
   return `OK: ${key}'s gold is now ${bucket[key]} (${amount >= 0 ? "+" : ""}${amount}).`;
 }
 
-async function addItem(channelId, playerName, itemName, quantity) {
+async function addItem(channelId, playerName, itemName, quantity, equipType, equipStats, equipTier) {
   quantity = Number(quantity) || 1;
   if (!itemName) return "ERROR: add_item needs an item_name.";
   const charBucket = characters.data.get(channelId) || {};
@@ -431,8 +673,11 @@ async function addItem(channelId, playerName, itemName, quantity) {
   const invBucket = getChannelBucket(inventories, channelId);
   const items = invBucket[key] || (invBucket[key] = []);
   const existing = items.find((i) => i.item.toLowerCase() === itemName.toLowerCase());
+  // Equip fields only apply when the entry is first created — if it's already there, stacking
+  // more quantity onto it shouldn't silently change (or clear) whatever equipment data it
+  // already has just because this particular call didn't repeat it.
   if (existing) existing.quantity += quantity;
-  else items.push({ item: itemName, quantity });
+  else items.push({ item: itemName, quantity, ...buildEquipFields(equipType, equipStats, equipTier) });
   await inventories.scheduleSave();
   return `OK: ${key} receives ${quantity}x ${itemName}.`;
 }
@@ -454,7 +699,7 @@ async function removeItem(channelId, playerName, itemName, quantity) {
   return `OK: ${quantity}x ${itemName} removed from ${key}'s inventory.`;
 }
 
-async function buyItem(channelId, playerName, itemName, price, quantity) {
+async function buyItem(channelId, playerName, itemName, price, quantity, equipType, equipStats, equipTier) {
   quantity = Number(quantity) || 1;
   price = Number(price);
   if (!itemName) return "ERROR: buy_item needs an item_name.";
@@ -473,7 +718,7 @@ async function buyItem(channelId, playerName, itemName, price, quantity) {
   const items = invBucket[key] || (invBucket[key] = []);
   const existing = items.find((i) => i.item.toLowerCase() === itemName.toLowerCase());
   if (existing) existing.quantity += quantity;
-  else items.push({ item: itemName, quantity });
+  else items.push({ item: itemName, quantity, ...buildEquipFields(equipType, equipStats, equipTier) });
 
   await Promise.all([wallets.scheduleSave(), inventories.scheduleSave()]);
   return `OK: ${key} buys ${quantity}x ${itemName} for ${total} gold (${walletBucket[key]} gold left).`;
@@ -539,6 +784,18 @@ export const MECHANICS_FUNCTION_DECLARATIONS = [
             "just difficulty when something is a real stretch for the character's class/concept " +
             "but you're still letting them attempt it.",
         },
+        item_used: {
+          type: "string",
+          description:
+            "Optional: the exact Inventory item name the character is wielding for THIS action " +
+            "(an attack with a weapon, a spellcast with a focus). Verifies they actually have it " +
+            "(errors if not, same as any other item-possession check) and automatically adds a " +
+            "mechanical bonus if it's a weapon/focus that fits the stat being rolled (a sword " +
+            "helps a str attack, a bow helps a dex attack, a wand/holy symbol helps " +
+            "int/wis/cha spellcasting). Omit for checks with no specific item involved " +
+            "(persuasion, sneaking bare-handed, etc.) — armor/shields never go here, their " +
+            "defense bonus applies automatically and passively in monster_attack instead.",
+        },
         reason: { type: "string", description: "Brief reason, e.g. 'forcing open the locked chest'." },
       },
       required: ["player_name", "stat", "difficulty"],
@@ -563,7 +820,12 @@ export const MECHANICS_FUNCTION_DECLARATIONS = [
     description:
       "Apply damage (or healing, with a negative amount) to a monster or a player character's " +
       "HP. Always call this before narrating any HP change — never state a damage/heal number " +
-      "without calling this first.",
+      "without calling this first. Damage guidance: 2-6 for a weak/minor enemy, 5-10 for a " +
+      "standard enemy, 8-15 for a strong/elite enemy, 12-20+ reserved for a boss/climactic " +
+      "threat. Avoid dropping a fresh full-HP character to 0 in one or two hits outside a " +
+      "deliberately climactic moment — this matters most in the opening encounter of a session, " +
+      "which should be survivable for a fresh level-1 party. Has no effect on a character already " +
+      "at 0 HP — see revive_character to bring them back.",
     parametersJsonSchema: {
       type: "object",
       properties: {
@@ -594,6 +856,30 @@ export const MECHANICS_FUNCTION_DECLARATIONS = [
         reason: { type: "string", description: "Brief description of the attack, e.g. 'claw swipe' or 'frost curse'." },
       },
       required: ["monster_name", "target_player_name", "defense_stat"],
+    },
+  },
+  {
+    name: "revive_character",
+    description:
+      "Bring a dead (0 HP) character back into play. Only call this once a revival has actually " +
+      "been earned in the fiction: a party spellcaster/healer succeeded a skill_check attempting " +
+      "resurrection magic (cost 0), or the party paid a temple/priest's service fee back in a " +
+      "safe town (cost > 0). Do NOT call this for ordinary in-combat healing on a living " +
+      "character — use apply_damage with a negative amount for that instead; this tool only " +
+      "works on a character currently at 0 HP. This tool deducts the full cost itself, " +
+      "atomically — if a payer was short on gold and you narrate them coming up with the rest " +
+      "(selling something, borrowing, etc.), do NOT separately call modify_wallet to pre-pay any " +
+      "part of it; once they can cover the full cost, just call revive_character once with the " +
+      "complete cost and let it deduct everything in that single call.",
+    parametersJsonSchema: {
+      type: "object",
+      properties: {
+        player_name: { type: "string", description: "The dead (0 HP) player's Discord username." },
+        hp_restored: { type: "number", description: "HP to revive them with (positive; clamped to their max HP). A weaker revival might restore only a portion, a stronger one their full max." },
+        cost: { type: "number", description: "Gold cost of this revival — 0 for free resurrection magic, positive for a temple's paid service. Defaults to 0." },
+        payer_name: { type: "string", description: "Optional: whose gold pays the cost, if not the revived character's own (e.g. a party member covering the fee)." },
+      },
+      required: ["player_name", "hp_restored"],
     },
   },
   {
@@ -653,6 +939,38 @@ export const MECHANICS_FUNCTION_DECLARATIONS = [
         player_name: { type: "string", description: "The player's Discord username." },
         item_name: { type: "string", description: "The item's name." },
         quantity: { type: "number", description: "How many to add (default 1)." },
+        equip_type: {
+          type: "string",
+          enum: EQUIPMENT_TYPES,
+          description:
+            "Optional — only set this if the item is meaningfully a weapon/armor/shield, not " +
+            "for ordinary loot/quest items/consumables. 'weapon': a mechanical bonus applies " +
+            "later when a player wields it via skill_check's item_used, if it matches one of " +
+            "equip_stats. 'armor' or 'shield': the bonus applies automatically and passively to " +
+            "that character's defense DC in monster_attack, no further tool call needed. Base " +
+            "this purely on what the item fictionally IS (a sword, a breastplate, a raygun, " +
+            "'Frostbrand' the enchanted blade — anything you'd narrate as a weapon or protective " +
+            "gear), never on keywords in its name.",
+        },
+        equip_stats: {
+          type: "array",
+          items: { type: "string", enum: VALID_STATS },
+          description:
+            "Required if equip_type is 'weapon': which stat(s) this weapon suits, your own " +
+            "judgment based on what it fictionally is — e.g. ['str'] for a heavy melee weapon, " +
+            "['dex'] for something ranged/thrown, ['str','dex'] for a light finesse weapon " +
+            "usable either way, ['int','wis','cha'] for a spellcasting focus. Ignored for " +
+            "armor/shield.",
+        },
+        equip_tier: {
+          type: "string",
+          enum: ["standard", "fine", "legendary"],
+          description:
+            "Only meaningful alongside equip_type. How powerful this gear is, by your own " +
+            "judgment of its fictional significance: 'standard' (ordinary gear — the default if " +
+            "omitted), 'fine' (masterwork/exceptional), 'legendary' (rare, story-significant, or " +
+            "magical). Higher tiers grant a bigger mechanical bonus.",
+        },
       },
       required: ["player_name", "item_name"],
     },
@@ -685,6 +1003,21 @@ export const MECHANICS_FUNCTION_DECLARATIONS = [
         item_name: { type: "string", description: "The item's name." },
         price: { type: "number", description: "Price per item, in gold." },
         quantity: { type: "number", description: "How many to buy (default 1)." },
+        equip_type: {
+          type: "string",
+          enum: EQUIPMENT_TYPES,
+          description: "Optional — same meaning as add_item's equip_type; set this if what's being bought is meaningfully a weapon/armor/shield.",
+        },
+        equip_stats: {
+          type: "array",
+          items: { type: "string", enum: VALID_STATS },
+          description: "Same meaning as add_item's equip_stats — required if equip_type is 'weapon'.",
+        },
+        equip_tier: {
+          type: "string",
+          enum: ["standard", "fine", "legendary"],
+          description: "Same meaning as add_item's equip_tier — defaults to 'standard' if omitted.",
+        },
       },
       required: ["player_name", "item_name", "price"],
     },
@@ -718,13 +1051,15 @@ export async function runMechanicsAction(name, args, ctx) {
   const channelId = ctx?.channelId;
   switch (name) {
     case "skill_check":
-      return skillCheck(channelId, args?.player_name, args?.stat, args?.difficulty, args?.required_successes);
+      return skillCheck(channelId, args?.player_name, args?.stat, args?.difficulty, args?.required_successes, args?.item_used);
     case "spawn_monster":
       return spawnMonster(channelId, args?.name, args?.max_hp);
     case "apply_damage":
       return applyDamage(channelId, args?.target_type, args?.target_name, args?.amount, args?.reason);
     case "monster_attack":
       return monsterAttack(channelId, args?.monster_name, args?.target_player_name, args?.defense_stat);
+    case "revive_character":
+      return reviveCharacter(channelId, args?.player_name, args?.hp_restored, args?.cost, args?.payer_name);
     case "add_exp":
       return addExp(channelId, args?.player_name, args?.amount);
     case "modify_character_stat":
@@ -732,11 +1067,11 @@ export async function runMechanicsAction(name, args, ctx) {
     case "modify_wallet":
       return modifyWallet(channelId, args?.player_name, args?.amount);
     case "add_item":
-      return addItem(channelId, args?.player_name, args?.item_name, args?.quantity);
+      return addItem(channelId, args?.player_name, args?.item_name, args?.quantity, args?.equip_type, args?.equip_stats, args?.equip_tier);
     case "remove_item":
       return removeItem(channelId, args?.player_name, args?.item_name, args?.quantity);
     case "buy_item":
-      return buyItem(channelId, args?.player_name, args?.item_name, args?.price, args?.quantity);
+      return buyItem(channelId, args?.player_name, args?.item_name, args?.price, args?.quantity, args?.equip_type, args?.equip_stats, args?.equip_tier);
     case "sell_item":
       return sellItem(channelId, args?.player_name, args?.item_name, args?.price, args?.quantity);
     default:

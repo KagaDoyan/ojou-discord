@@ -21,7 +21,6 @@ import { clearMechanicsState } from "./dndMechanics.js";
 const {
   GEMINI_API_KEY,
   GEMINI_MODEL = "gemini-3.1-flash-lite",
-  GEMINI_GROUNDING_MODEL = "gemini-2.5-flash-lite",
   DEFAULT_LOCATION = "Vientiane, Laos",
   DEFAULT_TIMEZONE = "Asia/Vientiane",
 } = process.env;
@@ -182,7 +181,7 @@ async function summarizeHistory(oldSummary, turnsToCompact) {
     (oldSummary ? `EXISTING SUMMARY SO FAR:\n${oldSummary}\n\n` : "") +
     `NEW EVENTS TO FOLD IN:\n${transcript}\n\nCondense into an updated compact running summary.`;
   const res = await generateContentPaced({
-    model: GEMINI_GROUNDING_MODEL,
+    model: GEMINI_MODEL,
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     config: {
       systemInstruction: "You condense tabletop RPG session logs into compact recaps. No roleplay, no persona.",

@@ -15,7 +15,7 @@ import { AYAME_DM_PERSONA, buildDndInstructions } from "./persona.js";
 import { DND_FUNCTION_DECLARATIONS, isDndAction, runDndAction, loadDndSessions, createCharacter, buildPartyStatusText } from "./dnd.js";
 import { clearMechanicsState, getCharacterSheet } from "./dndMechanics.js";
 
-const { GEMINI_API_KEY, GEMINI_MODEL = "gemini-3.1-flash-lite", GEMINI_GROUNDING_MODEL = "gemini-2.5-flash-lite", DEFAULT_LOCATION = "Vientiane, Laos", DEFAULT_TIMEZONE = "Asia/Vientiane" } = process.env;
+const { GEMINI_API_KEY, GEMINI_MODEL = "gemini-3.1-flash-lite", DEFAULT_LOCATION = "Vientiane, Laos", DEFAULT_TIMEZONE = "Asia/Vientiane" } = process.env;
 if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY in .env");
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
@@ -120,7 +120,7 @@ async function summarizeHistory(oldSummary, turnsToCompact) {
   const transcript = turnsToCompact.map((t) => `${t.role === "user" ? "Player" : "Ayame"}: ${t.parts?.[0]?.text ?? ""}`).join("\n");
   const prompt = (oldSummary ? `EXISTING SUMMARY SO FAR:\n${oldSummary}\n\n` : "") + `NEW EVENTS TO FOLD IN:\n${transcript}\n\nCondense into an updated compact running summary.`;
   const res = await generateContentPaced({
-    model: GEMINI_GROUNDING_MODEL,
+    model: GEMINI_MODEL,
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     config: { systemInstruction: "You condense tabletop RPG session logs into compact recaps. No roleplay, no persona.", maxOutputTokens: 300 },
   });

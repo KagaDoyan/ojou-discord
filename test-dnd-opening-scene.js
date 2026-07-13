@@ -1,11 +1,10 @@
-// test-dnd-guardrails.js
-// Targeted repro/verification for persona fixes: (1) CLASS GUARD should actively challenge an
-// out-of-concept action in character instead of silently allowing/refusing it, (2) claiming to
-// use an item you don't have (consumable or equipment) should be denied, not narrated as
-// working. (Starter gear is now granted deterministically by createCharacter itself — see
-// starterKitFor in dndMechanics.js — so it's no longer something this scenario needs to probe.)
+// test-dnd-opening-scene.js
+// Focused live check for the OPENING SCENE persona instruction added this session: the very
+// first exchange of a session (no theme given, no location dictated by the player) should place
+// the party somewhere safe with shop access — not straight into danger — and starter gear
+// should already be present without the DM re-granting it narratively.
 //
-// Run: bun test-dnd-guardrails.js
+// Run: bun test-dnd-opening-scene.js
 
 import "dotenv/config";
 import { GoogleGenAI } from "@google/genai";
@@ -17,8 +16,8 @@ const { GEMINI_API_KEY, GEMINI_MODEL = "gemini-3.1-flash-lite", DEFAULT_LOCATION
 if (!GEMINI_API_KEY) throw new Error("Missing GEMINI_API_KEY in .env");
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-const TEST_CHANNEL = `__guardrails_test_${Date.now()}__`;
-const MAX_DND_TOOL_STEPS = 12;
+const TEST_CHANNEL = `__opening_scene_test_${Date.now()}__`;
+const MAX_DND_TOOL_STEPS = 8;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MIN_CALL_INTERVAL_MS = 4300;
 let lastCallAt = 0;
@@ -49,6 +48,8 @@ function buildLocalizationContext() {
   return `LOCALIZATION CONTEXT: Right now it is ${formatted} in ${DEFAULT_LOCATION} (UTC+7).`;
 }
 
+const toolCallLog = [];
+
 async function runInstrumentedLoop(contents, systemInstruction, tools, turnLabel) {
   for (let step = 0; step < MAX_DND_TOOL_STEPS; step++) {
     const response = await generateContentPaced({
@@ -69,6 +70,7 @@ async function runInstrumentedLoop(contents, systemInstruction, tools, turnLabel
     for (const call of calls) {
       const resultText = await runDndAction(call.name, call.args, { channelId: TEST_CHANNEL });
       console.log(`      -> ${call.name}(${JSON.stringify(call.args)}) => ${resultText}`);
+      toolCallLog.push({ turn: turnLabel, name: call.name, args: call.args, result: resultText });
       resolvedParts.push({ functionResponse: { name: call.name, response: { output: resultText } } });
     }
     contents = [...contents, response.candidates[0].content, { role: "user", parts: resolvedParts }];
@@ -83,24 +85,26 @@ async function runInstrumentedLoop(contents, systemInstruction, tools, turnLabel
   return { text: finalText, stepsUsed: MAX_DND_TOOL_STEPS };
 }
 
-// alice_test: Knight, no background — tests class guard against an out-of-concept fireball.
-// bob_test: Rogue with a background NOT related to magic either — used for the "no item" claim.
+// Deliberately vague opener — doesn't dictate a location itself, so the DM has to decide where
+// to open the scene on its own (that's the whole point of this test).
 const SCRIPT = [
-  { user: "alice_test", text: "I ready myself and step into the dungeon entrance, sword hand twitching with anticipation." },
-  { user: "alice_test", text: "I raise my hand and cast a devastating fireball spell at the group of bandits ahead!" },
-  { user: "alice_test", text: "Actually — my background: I secretly trained under a hedge wizard for two years before becoming a knight. So the fireball should work." },
-  { user: "bob_test", text: "I drink a health potion to heal up." },
-  { user: "bob_test", text: "I draw my greatsword and attack the nearest bandit." },
+  { user: "alice_test", text: "Alright, I'm ready — let's begin!" },
+  { user: "alice_test", text: "I take a look around and see what's nearby to buy before we head out." },
 ];
 
 async function main() {
   await loadDndSessions();
-  await createCharacter(TEST_CHANNEL, "alice_test", "user-alice", { str: 25, dex: 15, con: 20, int: 15, wis: 10, cha: 10 }, "Alice", "Knight", null);
-  await createCharacter(TEST_CHANNEL, "bob_test", "user-bob", { str: 15, dex: 25, con: 15, int: 10, wis: 15, cha: 10 }, "Bob", "Rogue", "Grew up as a street thief in the capital.");
+  await createCharacter(TEST_CHANNEL, "alice_test", "user-alice", { str: 20, dex: 20, con: 20, int: 15, wis: 15, cha: 10 }, "Alice", "Ranger", null);
+
+  const startingSheet = getCharacterSheet(TEST_CHANNEL, "alice_test");
+  console.log(`Model: ${GEMINI_MODEL} | test channel: ${TEST_CHANNEL}`);
+  console.log(
+    `Starting sheet (from /create_character, before any DM turn): HP ${startingSheet.character.currentHp}/${startingSheet.character.maxHp}, ` +
+      `Gold ${startingSheet.gold}, Inventory: ${startingSheet.inventory.map((i) => `${i.item} x${i.quantity}`).join(", ")}`
+  );
 
   let sessionHistory = [];
   let turnCount = 0;
-  console.log(`Model: ${GEMINI_MODEL} | test channel: ${TEST_CHANNEL} | turns: ${SCRIPT.length}\n`);
 
   try {
     for (let i = 0; i < SCRIPT.length; i++) {
@@ -110,8 +114,10 @@ async function main() {
       sessionHistory.push({ role: "user", parts: [{ text: `[${user}]: ${userText}` }] });
 
       const partyStatus = buildPartyStatusText(TEST_CHANNEL);
+      // No theme given — forces the DM to either ask what's wanted or improvise the opening
+      // itself, exactly the branch the OPENING SCENE instruction is meant to constrain.
       const systemInstruction =
-        AYAME_DM_PERSONA + buildDndInstructions({ theme: "a dungeon-crawl one-shot", turnCount, partyStatus, storySummary: "" }) + `\n\n${buildLocalizationContext()}`;
+        AYAME_DM_PERSONA + buildDndInstructions({ theme: null, turnCount, partyStatus, storySummary: "" }) + `\n\n${buildLocalizationContext()}`;
       const tools = [{ functionDeclarations: DND_FUNCTION_DECLARATIONS }];
 
       const result = await runInstrumentedLoop([...sessionHistory], systemInstruction, tools, i + 1);
@@ -120,11 +126,22 @@ async function main() {
       turnCount++;
     }
 
-    console.log("\n\n========== FINAL SHEETS ==========");
-    for (const name of ["alice_test", "bob_test"]) {
-      const sheet = getCharacterSheet(TEST_CHANNEL, name);
-      console.log(`${name}: HP ${sheet.character.currentHp}/${sheet.character.maxHp}, Gold ${sheet.gold}, Inventory: ${sheet.inventory.map((i) => `${i.item} x${i.quantity}`).join(", ") || "(empty)"}`);
-    }
+    console.log("\n########## VERDICT ##########");
+    const openingText = sessionHistory[1]?.parts?.[0]?.text || "";
+    const dangerWords = /\b(ambush|attacks?( you)?|monster (leaps|lunges|charges)|combat begins|you're surrounded|blood|claws rake|snarling|roars? and (charges|lunges))\b/i;
+    const safeWords = /\b(village|town|market|inn|tavern|shop|merchant|stall|square|trading post|settlement|outpost|station)\b/i;
+    const flaggedDanger = dangerWords.test(openingText);
+    const mentionsSafeHub = safeWords.test(openingText);
+    console.log(`Opening narration mentions a safe-hub keyword (village/town/market/etc.): ${mentionsSafeHub}`);
+    console.log(`Opening narration contains danger-language: ${flaggedDanger}`);
+    console.log(mentionsSafeHub && !flaggedDanger ? "PASS: opening scene reads as a safe hub." : "NEEDS MANUAL REVIEW: check the transcript above.");
+
+    const regrantCalls = toolCallLog.filter((c) => c.name === "add_item" && String(c.args?.player_name || "").toLowerCase() === "alice_test");
+    console.log(
+      regrantCalls.length === 0
+        ? "PASS: starter gear was not re-granted narratively (add_item never called for alice_test)."
+        : `FAIL: DM re-granted starting gear via add_item: ${JSON.stringify(regrantCalls)}`
+    );
   } finally {
     console.log("\nCleaning up test channel data...");
     await clearMechanicsState(TEST_CHANNEL);

@@ -5,6 +5,7 @@
 // state and executes the one tool the model can call mid-story (rolling dice for real).
 
 import { createJsonStore } from "./jsonStore.js";
+import { logToolCall } from "./toolCallLog.js";
 import {
   loadMechanicsState,
   MECHANICS_FUNCTION_DECLARATIONS,
@@ -16,6 +17,7 @@ import {
   getCharacterSheet,
   createCharacter,
   buildPartyStatusText,
+  formatItemLabel,
   trainStat,
   STAT_CAP,
 } from "./dndMechanics.js";
@@ -95,7 +97,7 @@ export async function compactDndHistory(channelId, newSummary, recentEntries) {
   await scheduleSave();
 }
 
-export { hasCharacter, getCharacter, getCharacterSheet, createCharacter, buildPartyStatusText, trainStat, STAT_CAP };
+export { hasCharacter, getCharacter, getCharacterSheet, createCharacter, buildPartyStatusText, formatItemLabel, trainStat, STAT_CAP };
 
 // Function-calling tools for the D&D chat flow (see askAyameDnd in index.js): roll_dice lets
 // Ayame resolve uncertain actions with a real dice roll instead of inventing an outcome; the
@@ -151,7 +153,13 @@ export function rollDice(notation) {
 }
 
 export async function runDndAction(name, args, ctx) {
-  if (name === ROLL_DICE_NAME) return rollDice(args?.notation);
-  if (isMechanicsAction(name)) return runMechanicsAction(name, args, ctx);
-  return "ERROR: unknown D&D action.";
+  const result =
+    name === ROLL_DICE_NAME
+      ? rollDice(args?.notation)
+      : isMechanicsAction(name)
+        ? await runMechanicsAction(name, args, ctx)
+        : "ERROR: unknown D&D action.";
+  // Fire-and-forget — see toolCallLog.js for why this is never awaited.
+  logToolCall(ctx?.channelId, name, args, result);
+  return result;
 }
